@@ -1,13 +1,8 @@
 import os
 import threading
-import time
-import re
-import requests
-import urllib.parse
-from queue import Queue
+import asyncio
 from flask import Flask
-import telebot
-from bs4 import BeautifulSoup
+from pyrogram import Client, filters, idle
 from mediafire.client import MediaFireClient
 
 # ==========================================
@@ -17,19 +12,19 @@ BOT_TOKEN = os.environ.get('BOT_TOKEN')
 MF_EMAIL = os.environ.get('MF_EMAIL')
 MF_PASSWORD = os.environ.get('MF_PASSWORD')
 
+# Credenciales de API de Telegram (Motor Pyrogram)
+API_ID = 38106196
+API_HASH = "30cfa1bb153d49728b4c060eea2e167d"
+
 if not BOT_TOKEN:
     print("⚠️ ADVERTENCIA: BOT_TOKEN no encontrado en las variables de entorno.")
-
-bot = telebot.TeleBot(BOT_TOKEN) if BOT_TOKEN else None
-app = Flask(__name__)
-
-cola_procesamiento = Queue()
-procesando_actualmente = False
 
 # ==========================================
 # 2. SERVIDOR WEB (FLASK) - DISEÑO PROFESIONAL
 # ==========================================
-@app.route('/')
+app_web = Flask(__name__)
+
+@app_web.route('/')
 def home():
     html_content = """
     <html>
@@ -45,7 +40,7 @@ def home():
         <body>
             <div class="status-box">
                 <h2>🟢 Nodo de Tránsito Operativo</h2>
-                <p>El puente de transferencia de archivos está activo y esperando instrucciones.</p>
+                <p>El puente Telegram ➔ MediaFire está en línea y operando.</p>
             </div>
         </body>
     </html>
@@ -54,200 +49,117 @@ def home():
 
 def run_web_server():
     port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+    app_web.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 # ==========================================
-# 3. LÓGICA DE TRANSFERENCIA MULTI-SERVIDOR
+# 3. MOTOR DE TELEGRAM (PYROGRAM)
 # ==========================================
-def obtener_sesion_mediafire():
-    """ Inicia sesión en tu cuenta destino usando la librería oficial """
+bot = Client(
+    "nexus_bot_session",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
+
+cola_procesamiento = asyncio.Queue()
+
+# ==========================================
+# 4. LÓGICA DE TRANSFERENCIA Y LIMPIEZA
+# ==========================================
+def operacion_mediafire(ruta_local, nombre_archivo):
+    """ Función síncrona que se ejecuta en un hilo separado para no bloquear el bot """
     try:
         mf_client = MediaFireClient()
         mf_client.login(email=MF_EMAIL, password=MF_PASSWORD, app_id='42511')
-        return mf_client
-    except Exception as e:
-        print(f"Error de login MediaFire: {e}")
-        return None
-
-def extraer_enlace_directo_origen(url_origen):
-    """ Obtiene el link directo real utilizando BeautifulSoup o APIs """
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
         
-        # --- LÓGICA PARA MEDIAFIRE ---
-        if "mediafire.com" in url_origen:
-            res = requests.get(url_origen, headers=headers, timeout=15)
-            soup = BeautifulSoup(res.content, 'html.parser')
-            button = soup.find('a', {'id': 'downloadButton'})
-            if button and button.get('href'):
-                return button.get('href')
-            return None
-            
-        # --- LÓGICA PARA WORKUPLOAD ---
-        elif "workupload.com" in url_origen:
-            session = requests.Session()
-            # 1. Visitar primero para obtener cookies silenciosamente
-            session.get(url_origen, headers=headers, timeout=15)
-            
-            # 2. Extraer ID y consultar su API interna
-            file_id = url_origen.rstrip('/').split("/")[-1]
-            api_url = f"https://workupload.com/api/file/getDownloadServer/{file_id}"
-            
-            # Es vital enviar el Referer para que la API responda
-            headers['Referer'] = url_origen
-            res = session.get(api_url, headers=headers, timeout=15)
-            
-            data = res.json()
-            if 'data' in data and 'url' in data['data']:
-                return data['data']['url']
-            return None
-
-        # --- OTROS ENLACES DIRECTOS ---
-        return url_origen 
-    except Exception as e:
-        print(f"Error extrayendo enlace de origen: {e}")
-        return None
-
-def procesar_transferencia(url_origen, chat_id):
-    """ Descarga al disco temporal del VPS y sube a MediaFire """
-    ruta_temporal = ""
-    try:
-        bot.send_message(chat_id, f"🔄 Procesando origen:\n{url_origen}")
-        
-        # 1. Obtener Enlace Directo
-        url_descarga_directa = extraer_enlace_directo_origen(url_origen)
-        
-        if not url_descarga_directa or url_descarga_directa == url_origen and ("mediafire.com" in url_origen or "workupload.com" in url_origen):
-            bot.send_message(chat_id, "❌ Error: No se pudo extraer el enlace directo de descarga.")
-            return
-
-        # 2. Conectar a MediaFire Pro
-        mf_client = obtener_sesion_mediafire()
-        if not mf_client:
-            bot.send_message(chat_id, "❌ Error: Fallo de autenticación. Verifica las credenciales.")
-            return
-
-        # 3. Conectar al origen
-        respuesta_origen = requests.get(url_descarga_directa, stream=True, timeout=30)
-        respuesta_origen.raise_for_status()
-        
-        # 4. Asignar nombre
-        nombre_archivo = "transferencia.bin"
-        if "Content-Disposition" in respuesta_origen.headers:
-            matches = re.findall(r'filename="?([^"]+)"?', respuesta_origen.headers["Content-Disposition"])
-            if matches:
-                nombre_archivo = matches[0].strip()
-        else:
-            parsed_url = urllib.parse.urlparse(url_descarga_directa)
-            nombre_url = os.path.basename(parsed_url.path)
-            if nombre_url:
-                nombre_archivo = urllib.parse.unquote(nombre_url)
-            
-        ruta_temporal = f"./{nombre_archivo}"
-
-        # 5. Descarga por bloques al VPS (Optimizado para 512MB RAM)
-        bot.send_message(chat_id, f"📥 Descargando temporalmente al VPS ({nombre_archivo})...")
-        with open(ruta_temporal, 'wb') as f:
-            for chunk in respuesta_origen.iter_content(chunk_size=8 * 1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-
-        # 6. Subida final a MediaFire
-        bot.send_message(chat_id, "📤 Subiendo archivo hacia MediaFire Pro...")
         destino_mf = f"mf:/{nombre_archivo}"
-        mf_client.upload_file(ruta_temporal, destino_mf)
-
-        # 7. Obtener enlace público
-        link_final = None
+        mf_client.upload_file(ruta_local, destino_mf)
+        
+        # Buscar el archivo recién subido
         contenido_carpeta = mf_client.get_folder_contents_iter("mf:/")
         for item in contenido_carpeta:
             if item.get('filename') == nombre_archivo:
-                link_final = f"https://www.mediafire.com/file/{item.get('quickkey')}/{nombre_archivo}/file"
-                break
-
-        if link_final:
-            mensaje_exito = f"✅ **Transferencia Completada**\n\n📄 **Archivo:** {nombre_archivo}\n🔗 **Link:**\n{link_final}"
-            bot.send_message(chat_id, mensaje_exito, parse_mode='Markdown', disable_web_page_preview=True)
-        else:
-            bot.send_message(chat_id, "⚠️ El archivo se subió, pero hubo un problema al generar el enlace de retorno.")
-
+                return f"https://www.mediafire.com/file/{item.get('quickkey')}/{nombre_archivo}/file"
+        return None
     except Exception as e:
-        bot.send_message(chat_id, f"❌ Error crítico en el proceso: {str(e)}")
-        
-    finally:
-        # 8. Limpieza estricta: Garantiza que el disco de Render quede en 0 bytes ocupados
-        if ruta_temporal and os.path.exists(ruta_temporal):
-            os.remove(ruta_temporal)
-            print(f"🧹 Archivo temporal {ruta_temporal} eliminado del sistema.")
+        return str(e)
 
-# ==========================================
-# 4. MOTOR DE COLA SECUENCIAL
-# ==========================================
-def trabajador_de_cola():
-    global procesando_actualmente
+async def trabajador_de_cola():
+    """ Procesa los archivos uno por uno secuencialmente """
     while True:
-        if not cola_procesamiento.empty() and not procesando_actualmente:
-            procesando_actualmente = True
-            tarea = cola_procesamiento.get()
+        mensaje = await cola_procesamiento.get()
+        chat_id = mensaje.chat.id
+        
+        msg_estado = await bot.send_message(chat_id, "🔄 Preparando entorno para la transferencia...")
+        ruta_local = ""
+        
+        try:
+            # 1. Descarga segura al disco temporal (Evita saturar la RAM)
+            await msg_estado.edit_text("📥 Descargando archivo al nodo seguro por bloques...")
+            ruta_local = await mensaje.download()
+            nombre_archivo = os.path.basename(ruta_local)
+
+            # 2. Subida a MediaFire (usando asyncio.to_thread para no congelar Telegram)
+            await msg_estado.edit_text(f"📤 Subiendo hacia MediaFire Pro:\n`{nombre_archivo}`")
             
-            procesar_transferencia(tarea['url'], tarea['chat_id'])
+            resultado = await asyncio.to_thread(operacion_mediafire, ruta_local, nombre_archivo)
+            
+            # 3. Entrega de resultados
+            if resultado and resultado.startswith("http"):
+                texto_exito = f"✅ **Transferencia Completada**\n\n📄 **Archivo:** `{nombre_archivo}`\n🔗 **Link MediaFire:**\n{resultado}"
+                await msg_estado.edit_text(texto_exito, disable_web_page_preview=True)
+            else:
+                await msg_estado.edit_text(f"⚠️ Error en la generación del link de MediaFire. Detalles:\n{resultado}")
+
+        except Exception as e:
+            await msg_estado.edit_text(f"❌ Error crítico en el proceso: {str(e)}")
+            
+        finally:
+            # 4. Limpieza estricta: Garantiza que el disco del VPS se vacíe
+            if ruta_local and os.path.exists(ruta_local):
+                os.remove(ruta_local)
+                print(f"🧹 Archivo temporal {ruta_local} destruido.")
             
             cola_procesamiento.task_done()
-            procesando_actualmente = False
-        
-        time.sleep(2)
 
 # ==========================================
-# 5. BOT DE TELEGRAM - INTERFAZ
+# 5. RECEPCIÓN DE ARCHIVOS (INTERFAZ)
 # ==========================================
-def extraer_enlaces(texto):
-    patron_url = r'(https?://\S+)'
-    return re.findall(patron_url, texto)
+@bot.on_message(filters.command("start") & filters.private)
+async def cmd_start(client, message):
+    await message.reply_text("¡Listo! El nodo de transferencia de archivos pesados está activo. Envíame cualquier video o documento.")
 
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    bot.reply_to(message, "¡Listo! El nodo Nexus Flow está activo en Render. Envíame links directamente o a través de un archivo .txt.")
-
-@bot.message_handler(content_types=['text'])
-def recibir_texto(message):
-    enlaces_detectados = extraer_enlaces(message.text)
-    
-    if enlaces_detectados:
-        for link in enlaces_detectados:
-            cola_procesamiento.put({'chat_id': message.chat.id, 'url': link})
-        bot.reply_to(message, f"🔍 {len(enlaces_detectados)} enlace(s) detectados. Añadidos a la cola.")
-
-@bot.message_handler(content_types=['document'])
-def recibir_documento(message):
-    if message.document.file_name.endswith('.txt'):
-        bot.reply_to(message, "📄 Archivo TXT detectado. Extrayendo enlaces...")
-        try:
-            file_info = bot.get_file(message.document.file_id)
-            archivo_descargado = bot.download_file(file_info.file_path)
-            texto_archivo = archivo_descargado.decode('utf-8')
-            
-            enlaces_detectados = extraer_enlaces(texto_archivo)
-            
-            if enlaces_detectados:
-                for link in enlaces_detectados:
-                    cola_procesamiento.put({'chat_id': message.chat.id, 'url': link})
-                bot.reply_to(message, f"✅ Lista procesada. {len(enlaces_detectados)} enlace(s) añadidos a la cola secuencial.")
-            else:
-                bot.reply_to(message, "⚠️ No encontré ningún enlace válido en el documento.")
-        except Exception as e:
-            bot.reply_to(message, f"❌ Error leyendo el archivo TXT: {str(e)}")
+@bot.on_message((filters.video | filters.document) & filters.private)
+async def recibir_archivos(client, message):
+    await cola_procesamiento.put(message)
+    await message.reply_text("🔍 Archivo recibido de forma segura. Añadido a la cola secuencial.")
 
 # ==========================================
-# 6. INICIO DEL SISTEMA
+# 6. INICIO ASÍNCRONO DEL SISTEMA DUAL
 # ==========================================
-if __name__ == "__main__":
+async def iniciar_sistema():
+    # 1. Levantar la interfaz web en un hilo paralelo
     hilo_web = threading.Thread(target=run_web_server)
     hilo_web.daemon = True
     hilo_web.start()
+    print("🌐 Servidor web Flask iniciado.")
 
-    hilo_worker = threading.Thread(target=trabajador_de_cola)
-    hilo_worker.daemon = True
-    hilo_worker.start()
+    # 2. Iniciar el bot de Telegram
+    await bot.start()
+    print("🤖 Bot de Telegram en línea.")
 
-    if bot:
-        bot.infinity_polling(timeout=60, long_polling_timeout=60)
+    # 3. Iniciar el procesador secuencial de archivos pesados
+    asyncio.create_task(trabajador_de_cola())
+    print("⚙️ Motor de cola secuencial asíncrona iniciado.")
+
+    # 4. Mantener el sistema vivo y a la escucha
+    await idle()
+    await bot.stop()
+
+if __name__ == "__main__":
+    if BOT_TOKEN:
+        # Iniciar el bucle de eventos asíncronos nativo de Python
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(iniciar_sistema())
+    else:
+        print("❌ El sistema se detuvo porque no hay BOT_TOKEN configurado.")
