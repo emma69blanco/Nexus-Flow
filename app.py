@@ -94,7 +94,7 @@ def procesar_transferencia(url_origen, chat_id):
         # 1. Iniciar sesión segura con la librería oficial
         mf_client = obtener_sesion_mediafire()
         if not mf_client:
-            bot.send_message(chat_id, "❌ Error: Fallo de autenticación. Verifica las variables MF_EMAIL y MF_PASSWORD.")
+            bot.send_message(chat_id, "❌ Error: Fallo de autenticación. Verifica las variables.")
             return
 
         # 2. Iniciar conexión de descarga
@@ -108,7 +108,7 @@ def procesar_transferencia(url_origen, chat_id):
             
         ruta_temporal = f"./{nombre_archivo}"
 
-        # 3. Descargar al disco del VPS (Usando bloques para no colapsar la RAM)
+        # 3. Descargar al disco del VPS (Usando bloques)
         bot.send_message(chat_id, f"📥 Descargando temporalmente al VPS ({nombre_archivo})...")
         with open(ruta_temporal, 'wb') as f:
             for chunk in respuesta_origen.iter_content(chunk_size=8 * 1024 * 1024):
@@ -120,25 +120,26 @@ def procesar_transferencia(url_origen, chat_id):
         destino_mf = f"mf:/{nombre_archivo}"
         mf_client.upload_file(ruta_temporal, destino_mf)
 
-        # 5. Buscar el archivo recién subido para extraer el enlace público
+        # 5. Buscar el archivo recién subido para extraer el enlace público (CORREGIDO)
         link_final = None
         contenido_carpeta = mf_client.get_folder_contents_iter("mf:/")
         for item in contenido_carpeta:
-            if item['filename'] == nombre_archivo:
-                link_final = f"https://www.mediafire.com/file/{item['quickkey']}/{nombre_archivo}/file"
+            # Usamos .get('filename') para evitar el error si el item es una carpeta
+            if item.get('filename') == nombre_archivo:
+                link_final = f"https://www.mediafire.com/file/{item.get('quickkey')}/{nombre_archivo}/file"
                 break
 
         if link_final:
             mensaje_exito = f"✅ **Transferencia Completada**\n\n📄 **Archivo:** {nombre_archivo}\n🔗 **Link:**\n{link_final}"
             bot.send_message(chat_id, mensaje_exito, parse_mode='Markdown')
         else:
-            bot.send_message(chat_id, "⚠️ El archivo se subió a tu cuenta, pero hubo un problema generando el link.")
+            bot.send_message(chat_id, "⚠️ El archivo se subió a tu cuenta, pero hubo un problema generando el link. Revisa tu MediaFire.")
 
     except Exception as e:
         bot.send_message(chat_id, f"❌ Error crítico en el proceso: {str(e)}")
         
     finally:
-        # 6. Limpieza estricta del disco del VPS para el siguiente archivo
+        # 6. Limpieza estricta del disco del VPS
         if ruta_temporal and os.path.exists(ruta_temporal):
             os.remove(ruta_temporal)
 
