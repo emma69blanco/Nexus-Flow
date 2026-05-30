@@ -2,3 +2,4 @@ Flask
 pyTelegramBotAPI
 requests
 urllib3
+mediafire
