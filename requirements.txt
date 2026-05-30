@@ -3,3 +3,4 @@ pyTelegramBotAPI
 requests
 urllib3
 mediafire
+beautifulsoup4
