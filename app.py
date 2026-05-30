@@ -1,6 +1,16 @@
 import os
 import threading
 import asyncio
+
+# ==========================================
+# 0. PARCHE CRÍTICO PARA PYTHON 3.14+ (RENDER)
+# ==========================================
+# Obligamos a Python a crear un bucle de eventos ANTES de importar Pyrogram.
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
 from flask import Flask
 from pyrogram import Client, filters, idle
 from mediafire.client import MediaFireClient
@@ -74,7 +84,7 @@ def operacion_mediafire(ruta_local, nombre_archivo):
         mf_client = MediaFireClient()
         mf_client.login(email=MF_EMAIL, password=MF_PASSWORD, app_id='42511')
         
-        # Mantenemos la carpeta destino que configuraste en tu código original
+        # Mantenemos la carpeta destino
         carpeta_destino = "Subidas_Telegram"
         
         try:
@@ -117,14 +127,12 @@ async def procesar_paquete(chat_id):
         ruta_local = None
         
         try:
-            # Descarga gestionada por bloques directamente de Pyrogram
             ruta_local = await bot.download_media(mensaje_video)
             
             if ruta_local:
                 nombre_archivo = os.path.basename(ruta_local)
                 await mensaje_estado.edit_text(f"📤 **Archivo {i}/{total}:** Subiendo a MediaFire Pro...\n`{nombre_archivo}`")
                 
-                # Ejecutamos la subida en un hilo paralelo para no congelar Telegram
                 resultado = await asyncio.to_thread(operacion_mediafire, ruta_local, nombre_archivo)
                 
                 if resultado and resultado.startswith("http"):
@@ -138,7 +146,7 @@ async def procesar_paquete(chat_id):
             enlaces_finales.append(f"❌ **Archivo {i}:** Error crítico - {str(e)}")
             
         finally:
-            # LIMPIEZA INMEDIATA: Garantiza que se borre antes de bajar el siguiente video
+            # LIMPIEZA INMEDIATA
             if ruta_local and os.path.exists(ruta_local):
                 os.remove(ruta_local)
                 print(f"🧹 Archivo temporal {ruta_local} destruido con éxito.")
@@ -148,7 +156,6 @@ async def procesar_paquete(chat_id):
     reporte_texto = reporte_base + "\n\n".join(enlaces_finales)
 
     try:
-        # Sistema inteligente para evitar el límite de Telegram
         if len(reporte_texto) > 4000:
             await mensaje_estado.edit_text("📝 **El reporte es muy largo.** Generando archivo TXT seguro...")
             nombre_txt = f"reporte_enlaces_{chat_id}.txt"
@@ -176,7 +183,6 @@ async def procesar_paquete(chat_id):
     finally:
         await mensaje_estado.delete()
 
-# Temporizador para agrupar múltiples envíos rápidos
 async def esperar_paquete(chat_id):
     await asyncio.sleep(5)
     await procesar_paquete(chat_id)
@@ -192,42 +198,40 @@ async def cmd_start(client, message):
 async def recibir_videos(client, message):
     chat_id = message.chat.id
     
-    # Crear el espacio para el usuario si no existe
     if chat_id not in videos_por_usuario:
         videos_por_usuario[chat_id] = []
         
     videos_por_usuario[chat_id].append(message)
     
-    # Cancelar el contador anterior si envía otro archivo rápido
     if chat_id in temporizador_paquetes:
         temporizador_paquetes[chat_id].cancel()
         
-    # Iniciar un nuevo contador de 5 segundos
     temporizador_paquetes[chat_id] = asyncio.create_task(esperar_paquete(chat_id))
 
 # ==========================================
-# 7. INICIO ASÍNCRONO DEL SISTEMA (PARCHE APLICADO)
+# 7. INICIO ASÍNCRONO DEL SISTEMA
 # ==========================================
 async def iniciar_sistema():
-    # 1. Servidor Web
+    # Servidor Web
     hilo_web = threading.Thread(target=run_web_server)
     hilo_web.daemon = True
     hilo_web.start()
     print("🌐 Servidor web Flask iniciado.")
 
-    # 2. Iniciar Bot de Pyrogram
+    # Iniciar Bot
     await bot.start()
     print("🤖 Bot de Telegram en línea y esperando paquetes.")
     
-    # 3. Mantener corriendo
+    # Mantener corriendo
     await idle()
     await bot.stop()
 
 if __name__ == "__main__":
     if BOT_TOKEN:
         try:
-            # PARCHE: asyncio.run() crea y maneja correctamente el bucle en Python 3.10+
-            asyncio.run(iniciar_sistema())
+            # Reutilizamos el bucle de eventos forzado del inicio
+            loop = asyncio.get_event_loop()
+            loop.run_until_complete(iniciar_sistema())
         except KeyboardInterrupt:
             print("🛑 Sistema detenido manualmente.")
     else:
