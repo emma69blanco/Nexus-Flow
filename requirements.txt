@@ -1,6 +1,4 @@
 Flask
-pyTelegramBotAPI
-requests
-urllib3
+pyrogram
+tgcrypto
 mediafire
-beautifulsoup4
