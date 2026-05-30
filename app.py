@@ -12,7 +12,7 @@ BOT_TOKEN = os.environ.get('BOT_TOKEN')
 MF_EMAIL = os.environ.get('MF_EMAIL')
 MF_PASSWORD = os.environ.get('MF_PASSWORD')
 
-# Credenciales de API de Telegram (Motor Pyrogram)
+# Credenciales de API de Telegram
 API_ID = 38106196
 API_HASH = "30cfa1bb153d49728b4c060eea2e167d"
 
@@ -20,7 +20,7 @@ if not BOT_TOKEN:
     print("⚠️ ADVERTENCIA: BOT_TOKEN no encontrado en las variables de entorno.")
 
 # ==========================================
-# 2. SERVIDOR WEB (FLASK) - DISEÑO PROFESIONAL
+# 2. SERVIDOR WEB (FLASK) - DISEÑO LIMPIO
 # ==========================================
 app_web = Flask(__name__)
 
@@ -40,7 +40,7 @@ def home():
         <body>
             <div class="status-box">
                 <h2>🟢 Nodo de Tránsito Operativo</h2>
-                <p>El puente Telegram ➔ MediaFire está en línea y operando.</p>
+                <p>El puente de archivos Telegram ➔ MediaFire está en línea.</p>
             </div>
         </body>
     </html>
@@ -61,22 +61,31 @@ bot = Client(
     bot_token=BOT_TOKEN
 )
 
-cola_procesamiento = asyncio.Queue()
+# Diccionarios para manejar el sistema de "paquetes"
+temporizador_paquetes = {}
+videos_por_usuario = {}
 
 # ==========================================
-# 4. LÓGICA DE TRANSFERENCIA Y LIMPIEZA
+# 4. LÓGICA DE MEDIAFIRE
 # ==========================================
 def operacion_mediafire(ruta_local, nombre_archivo):
-    """ Función síncrona que se ejecuta en un hilo separado para no bloquear el bot """
+    """ Función aislada para ejecutar la subida a MediaFire """
     try:
         mf_client = MediaFireClient()
         mf_client.login(email=MF_EMAIL, password=MF_PASSWORD, app_id='42511')
         
-        destino_mf = f"mf:/{nombre_archivo}"
+        # Mantenemos la carpeta destino que configuraste en tu código original
+        carpeta_destino = "Subidas_Telegram"
+        
+        try:
+            mf_client.create_folder(f"mf:/{carpeta_destino}")
+        except:
+            pass # Si ya existe, se ignora el error
+            
+        destino_mf = f"mf:/{carpeta_destino}/{nombre_archivo}"
         mf_client.upload_file(ruta_local, destino_mf)
         
-        # Buscar el archivo recién subido
-        contenido_carpeta = mf_client.get_folder_contents_iter("mf:/")
+        contenido_carpeta = mf_client.get_folder_contents_iter(f"mf:/{carpeta_destino}")
         for item in contenido_carpeta:
             if item.get('filename') == nombre_archivo:
                 return f"https://www.mediafire.com/file/{item.get('quickkey')}/{nombre_archivo}/file"
@@ -84,82 +93,142 @@ def operacion_mediafire(ruta_local, nombre_archivo):
     except Exception as e:
         return str(e)
 
-async def trabajador_de_cola():
-    """ Procesa los archivos uno por uno secuencialmente """
-    while True:
-        mensaje = await cola_procesamiento.get()
-        chat_id = mensaje.chat.id
-        
-        msg_estado = await bot.send_message(chat_id, "🔄 Preparando entorno para la transferencia...")
-        ruta_local = ""
+# ==========================================
+# 5. MOTOR DE PROCESAMIENTO DE PAQUETES
+# ==========================================
+async def procesar_paquete(chat_id):
+    lista_videos = videos_por_usuario.get(chat_id, [])
+    total = len(lista_videos)
+    if total == 0: 
+        return
+
+    # Vaciamos la lista para próximos paquetes
+    videos_por_usuario[chat_id] = []
+    
+    mensaje_estado = await bot.send_message(
+        chat_id, 
+        f"🚀 **Procesando paquete de {total} archivo(s)...**\nPor favor espera, no envíes nada más hasta recibir el reporte."
+    )
+
+    enlaces_finales = []
+
+    for i, mensaje_video in enumerate(lista_videos, 1):
+        await mensaje_estado.edit_text(f"📥 **Archivo {i}/{total}:** Descargando desde Telegram al disco del VPS...")
+        ruta_local = None
         
         try:
-            # 1. Descarga segura al disco temporal (Evita saturar la RAM)
-            await msg_estado.edit_text("📥 Descargando archivo al nodo seguro por bloques...")
-            ruta_local = await mensaje.download()
-            nombre_archivo = os.path.basename(ruta_local)
-
-            # 2. Subida a MediaFire (usando asyncio.to_thread para no congelar Telegram)
-            await msg_estado.edit_text(f"📤 Subiendo hacia MediaFire Pro:\n`{nombre_archivo}`")
+            # Descarga gestionada por bloques directamente de Pyrogram
+            ruta_local = await bot.download_media(mensaje_video)
             
-            resultado = await asyncio.to_thread(operacion_mediafire, ruta_local, nombre_archivo)
-            
-            # 3. Entrega de resultados
-            if resultado and resultado.startswith("http"):
-                texto_exito = f"✅ **Transferencia Completada**\n\n📄 **Archivo:** `{nombre_archivo}`\n🔗 **Link MediaFire:**\n{resultado}"
-                await msg_estado.edit_text(texto_exito, disable_web_page_preview=True)
+            if ruta_local:
+                nombre_archivo = os.path.basename(ruta_local)
+                await mensaje_estado.edit_text(f"📤 **Archivo {i}/{total}:** Subiendo a MediaFire Pro...\n`{nombre_archivo}`")
+                
+                # Ejecutamos la subida en un hilo paralelo para no congelar Telegram
+                resultado = await asyncio.to_thread(operacion_mediafire, ruta_local, nombre_archivo)
+                
+                if resultado and resultado.startswith("http"):
+                    enlaces_finales.append(f"✅ **Archivo {i}:** {resultado}")
+                else:
+                    enlaces_finales.append(f"⚠️ **Archivo {i}:** Falló la generación de link.\nDetalle: {resultado}")
             else:
-                await msg_estado.edit_text(f"⚠️ Error en la generación del link de MediaFire. Detalles:\n{resultado}")
-
+                enlaces_finales.append(f"❌ **Archivo {i}:** Error al descargar de Telegram.")
+                
         except Exception as e:
-            await msg_estado.edit_text(f"❌ Error crítico en el proceso: {str(e)}")
+            enlaces_finales.append(f"❌ **Archivo {i}:** Error crítico - {str(e)}")
             
         finally:
-            # 4. Limpieza estricta: Garantiza que el disco del VPS se vacíe
+            # LIMPIEZA INMEDIATA: Garantiza que se borre antes de bajar el siguiente video
             if ruta_local and os.path.exists(ruta_local):
                 os.remove(ruta_local)
-                print(f"🧹 Archivo temporal {ruta_local} destruido.")
+                print(f"🧹 Archivo temporal {ruta_local} destruido con éxito.")
+
+    # GENERADOR DE REPORTE FINAL
+    reporte_base = "🎉 **¡PAQUETE COMPLETADO!**\n\nAquí tienes tus enlaces para guardar:\n\n"
+    reporte_texto = reporte_base + "\n\n".join(enlaces_finales)
+
+    try:
+        # Sistema inteligente para evitar el límite de Telegram
+        if len(reporte_texto) > 4000:
+            await mensaje_estado.edit_text("📝 **El reporte es muy largo.** Generando archivo TXT seguro...")
+            nombre_txt = f"reporte_enlaces_{chat_id}.txt"
             
-            cola_procesamiento.task_done()
+            with open(nombre_txt, "w", encoding="utf-8") as f:
+                f.write(f"🎉 ¡PAQUETE COMPLETADO!\nTotal de archivos procesados: {total}\n")
+                f.write("========================================\n\n")
+                for line in enlaces_finales:
+                    linea_limpia = line.replace("**", "").replace("✅ ", "")
+                    f.write(f"{linea_limpia}\n")
+                    
+            await bot.send_document(
+                chat_id=chat_id,
+                document=nombre_txt,
+                caption=f"📦 **¡Aquí tienes tu reporte masivo!**\nSe procesaron **{total}** archivos."
+            )
+            if os.path.exists(nombre_txt):
+                os.remove(nombre_txt)
+        else:
+            await bot.send_message(chat_id, reporte_texto, disable_web_page_preview=True)
+            
+    except Exception as e:
+        await bot.send_message(chat_id, f"❌ Error al enviar el reporte final: {e}")
+        
+    finally:
+        await mensaje_estado.delete()
+
+# Temporizador para agrupar múltiples envíos rápidos
+async def esperar_paquete(chat_id):
+    await asyncio.sleep(5)
+    await procesar_paquete(chat_id)
 
 # ==========================================
-# 5. RECEPCIÓN DE ARCHIVOS (INTERFAZ)
+# 6. INTERFAZ DE USUARIO (COMANDOS)
 # ==========================================
 @bot.on_message(filters.command("start") & filters.private)
 async def cmd_start(client, message):
-    await message.reply_text("¡Listo! El nodo de transferencia de archivos pesados está activo. Envíame cualquier video o documento.")
+    await message.reply_text("🟢 **¡Sistema Activo!**\nEnvíame videos o archivos pesados y los subiré directamente a tu carpeta única en MediaFire.")
 
 @bot.on_message((filters.video | filters.document) & filters.private)
-async def recibir_archivos(client, message):
-    await cola_procesamiento.put(message)
-    await message.reply_text("🔍 Archivo recibido de forma segura. Añadido a la cola secuencial.")
+async def recibir_videos(client, message):
+    chat_id = message.chat.id
+    
+    # Crear el espacio para el usuario si no existe
+    if chat_id not in videos_por_usuario:
+        videos_por_usuario[chat_id] = []
+        
+    videos_por_usuario[chat_id].append(message)
+    
+    # Cancelar el contador anterior si envía otro archivo rápido
+    if chat_id in temporizador_paquetes:
+        temporizador_paquetes[chat_id].cancel()
+        
+    # Iniciar un nuevo contador de 5 segundos
+    temporizador_paquetes[chat_id] = asyncio.create_task(esperar_paquete(chat_id))
 
 # ==========================================
-# 6. INICIO ASÍNCRONO DEL SISTEMA DUAL
+# 7. INICIO ASÍNCRONO DEL SISTEMA (PARCHE APLICADO)
 # ==========================================
 async def iniciar_sistema():
-    # 1. Levantar la interfaz web en un hilo paralelo
+    # 1. Servidor Web
     hilo_web = threading.Thread(target=run_web_server)
     hilo_web.daemon = True
     hilo_web.start()
     print("🌐 Servidor web Flask iniciado.")
 
-    # 2. Iniciar el bot de Telegram
+    # 2. Iniciar Bot de Pyrogram
     await bot.start()
-    print("🤖 Bot de Telegram en línea.")
-
-    # 3. Iniciar el procesador secuencial de archivos pesados
-    asyncio.create_task(trabajador_de_cola())
-    print("⚙️ Motor de cola secuencial asíncrona iniciado.")
-
-    # 4. Mantener el sistema vivo y a la escucha
+    print("🤖 Bot de Telegram en línea y esperando paquetes.")
+    
+    # 3. Mantener corriendo
     await idle()
     await bot.stop()
 
 if __name__ == "__main__":
     if BOT_TOKEN:
-        # Iniciar el bucle de eventos asíncronos nativo de Python
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(iniciar_sistema())
+        try:
+            # PARCHE: asyncio.run() crea y maneja correctamente el bucle en Python 3.10+
+            asyncio.run(iniciar_sistema())
+        except KeyboardInterrupt:
+            print("🛑 Sistema detenido manualmente.")
     else:
-        print("❌ El sistema se detuvo porque no hay BOT_TOKEN configurado.")
+        print("❌ Error crítico: Falta BOT_TOKEN en las variables de entorno.")
